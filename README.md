@@ -41,7 +41,7 @@ or install required modules via requirements.txt:
   for img in $(docker images --format '{{.Repository}}:{{.Tag}}'); do
     out="trivy-$(echo "$img" | tr -c 'A-Za-z0-9._-' '_').json"
     trivy image --ignore-unfixed --format json -o "$out" "$img"
-  done“
+  done
   ```
 
 **Saved .tar images**:
