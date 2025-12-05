@@ -272,7 +272,7 @@ def combine_by_package(df: pd.DataFrame):
         fixed_flat = []
         for cell in fixed_cells:
             fixed_flat.extend(split_values(cell))
-        fixed_all = dedupe_and_order(fixed_flat)
+        fixed_all = get_latest_version(fixed_flat)
 
         # Aggregate severity
         severity_cells = grouped["Severity"].tolist()
@@ -297,10 +297,33 @@ def dedupe_and_order(items: List[str]):
     seen = set()
     out = []
     for finding in items:
-        if finding not in seen:
-            seen.add(finding)
-            out.append(finding)
+        normalized = re.sub(r"^\d+:", "", finding.strip())
+        if normalized not in seen:
+            seen.add(normalized)
+            out.append(normalized)
     return out
+
+# Convert version string into a key to only output the hightest / most recent version
+def version_key(s: str):
+    s = (s or "").strip()
+    parts = re.split(r"(\d+)", s)
+    key = []
+    for part in parts:
+        if not part:
+            continue
+        if part.isdigit():
+            key.append(int(part))
+        else:
+            key.append(part)
+    return tuple(key)
+
+# Return latest / most recent fixed version of a package
+def get_latest_version(items: List[str]):
+    deduped = dedupe_and_order(items)
+    if not deduped:
+        return []
+    latest = max(deduped, key=version_key)
+    return [latest]
 
 def normalize_type(t: str) -> str:
     t = (t or "").strip().lower()
