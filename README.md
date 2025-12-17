@@ -38,7 +38,10 @@ or install required modules via requirements.txt:
 ## Trivy Commands:
 **Docker Repository**:
   ```bash
-  for img in $(docker images --format ‘{{.Repository}}; do trivy image --ignore-unfixed --format json -o "trivy/trivy-${.Respository}.json“
+  for img in $(docker images --format '{{.Repository}}:{{.Tag}}'); do
+    out="trivy-$(echo "$img" | tr -c 'A-Za-z0-9._-' '_').json"
+    trivy image --ignore-unfixed --format json -o "$out" "$img"
+  done
   ```
 
 **Saved .tar images**:
@@ -49,7 +52,10 @@ or install required modules via requirements.txt:
 ## Grype Commands:
 **Docker Repository**:
   ```bash
-  for img in $(docker images --format ‘{{.Repository}}; do grype --only-fixed -o json > "grype/grype-${.Respository}.json"
+  for img in $(docker images --format '{{.Repository}}:{{.Tag}}'); do
+    out="grype-$(echo "$img" | tr -c 'A-Za-z0-9._-' '_').json"
+    grype --only-fixed -o json "$img" > "$out"
+  done
   ```
 
 **Saved .tar images**:
