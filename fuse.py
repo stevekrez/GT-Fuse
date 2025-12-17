@@ -51,6 +51,7 @@ TRIVY_TYPE_MAP = {
     "go": "golang",
     "python": "python",
     "pip": "python",
+    "python-pkg": "python",
     "gem": "gem",
     "ruby": "ruby",
 }
@@ -210,6 +211,16 @@ def deduplicate_ids(ids: List[str]):
             seen_cves.add(cve)
     return out
 
+# Filter a list of IDs so CVEs are always included, and advisories are optional
+def filter_ids(ids: List[str], include_advisories: bool):
+    ids = deduplicate_ids(ids)
+    if include_advisories:
+        return order_cves_first(ids)
+    # keep CVEs only
+    cves_only = [x for x in ids if cve_token(x)]
+    return order_cves_first(cves_only)
+
+
 # Dreate mapping for severity ranks
 SEVERITY_RANK = {
     "CRITICAL": 5, "Critical": 5,
@@ -339,7 +350,7 @@ def collect_advisory_ids_from_trivy(vuln: Dict):
 
 ###
 # Read Trivy JSON output
-def read_trivy_json(json_path: str):
+def read_trivy_json(json_path: str, include_advisories: bool):
     try:
         with open(json_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -356,11 +367,14 @@ def read_trivy_json(json_path: str):
         vulns_list = (result or {}).get("Vulnerabilities", []) or []
         for vulnerability in vulns_list:
             package = str(vulnerability.get("PkgName", "") or vulnerability.get("PkgID", "") or "")
+            if reported_type == "python":
+                package = package.lower()
             installed = str(vulnerability.get("InstalledVersion", "") or "")
             fixed = str(vulnerability.get("FixedVersion", "") or "")
             severity = str(vulnerability.get("Severity", "") or "Unknown")
 
             ids = collect_advisory_ids_from_trivy(vulnerability)
+            ids = filter_ids(ids, include_advisories)
             cves_cell = "\n".join(ids)
 
             rows.append([package, reported_type, cves_cell, installed, fixed, severity])
@@ -382,7 +396,7 @@ def iter_paths(spec: Iterable[str]):
                     yield file
 
 # Parse Grype JSON outputs
-def parse_grype_json_one(json_path: str):
+def parse_grype_json_one(json_path: str, include_advisories: bool):
     try:
         with open(json_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -401,7 +415,9 @@ def parse_grype_json_one(json_path: str):
         package = str(art.get("name", "") or "")
         installed = str(art.get("version", "") or "")
         type_raw = str(art.get("type", "") or "")
-        type = normalize_type(type_raw)
+        pkg_type = normalize_type(type_raw)
+        if pkg_type == "python":
+            package = package.lower()
         #type = str(art.get("type", "") or "")
 
         id_list = []
@@ -416,18 +432,28 @@ def parse_grype_json_one(json_path: str):
                 if advisory_id:
                     id_list.append(convert_id(advisory_id))
 
-        related_vulnerabilities = vuln.get("relatedVulnerabilities", []) or []
+        # Grype stores CVEs for Java separately in relatedVulnerabilities
+        related_vulnerabilities = match.get("relatedVulnerabilities", []) or vuln.get("relatedVulnerabilities", []) or []
         if isinstance(related_vulnerabilities, list):
             for related_vuln in related_vulnerabilities:
                 related_vuln_id = str((related_vuln or {}).get("id", "") or "")
                 if related_vuln_id:
                     id_list.append(convert_id(related_vuln_id))
 
+        # Grype outputs also repeat the CVE under vulnerability.epss[].cve
+        epss_list = vuln.get("epss", []) or []
+        if isinstance(epss_list, list):
+            for e in epss_list:
+                epss_cve = str((e or {}).get("cve", "") or "")
+                if epss_cve:
+                    id_list.append(convert_id(epss_cve))
+
         # dedup preserving order
         seen = set(); ids_unique = []
         for item in id_list:
             if item not in seen:
                 seen.add(item); ids_unique.append(item)
+        ids_unique = filter_ids(ids_unique, include_advisories)
         cves_cell = "\n".join(ids_unique)
 
         fix = vuln.get("fix", {}) or {}
@@ -462,7 +488,7 @@ def parse_grype_json_one(json_path: str):
         if kev_bool and "(KEV)" not in severity:
             severity = f"{severity} (KEV)" if severity else "Unknown (KEV)"
 
-        rows.append([package, type, cves_cell, installed, fixed, severity])
+        rows.append([package, pkg_type, cves_cell, installed, fixed, severity])
 
     df = pd.DataFrame(rows, columns=EXPECTED_COLUMNS)
     df = df.replace([np.inf, -np.inf], pd.NA).fillna("")
@@ -640,6 +666,7 @@ def main():
     ap.add_argument("--grype", nargs="*", default=[],
                     help="Directory or file for Grype JSON file(s) (e.g., /path/to/*.json)")
     ap.add_argument("--kev", action="store_true", help="Check KEV from CISA GitHub and tag Trivy rows if a CVE is present.")
+    ap.add_argument("--advisories", action="store_true", help="Include advisory IDs (GHSA/RHSA/USN/...) alongside CVEs in the CVEs column. CVEs are always included.")
 
     out_group = ap.add_mutually_exclusive_group(required=True)
     out_group.add_argument("--out", help="Output .xlsx path (multi-sheet, one sheet per image)")
@@ -684,7 +711,7 @@ def main():
                 if os.path.getsize(trivy_file) == 0:
                     print(f"Skipping empty file: {trivy_file}")
                     continue
-                df = read_trivy_json(trivy_file)
+                df = read_trivy_json(trivy_file, args.advisories)
                 if df.empty:
                     print(f"No vulnerabilities found in Trivy output: {trivy_file}")
                     continue
@@ -701,7 +728,7 @@ def main():
                 if os.path.getsize(grype_file) == 0:
                     print(f"Skipping empty file: {grype_file}")
                     continue
-                df = parse_grype_json_one(grype_file)
+                df = parse_grype_json_one(grype_file, args.advisories)
                 if df.empty:
                     print(f"No vulnerabilities found in Grype output: {grype_file}")
                     continue
@@ -758,7 +785,7 @@ def main():
             if os.path.getsize(trivy_file) == 0:
                 print(f"Skipping empty file: {trivy_file}")
                 continue
-            df = read_trivy_json(trivy_file)
+            df = read_trivy_json(trivy_file, args.advisories)
             if df.empty:
                 print(f"No vulnerabilities found in Trivy output: {trivy_file}")
                 continue
@@ -775,7 +802,7 @@ def main():
             if os.path.getsize(grype_file) == 0:
                 print(f"Skipping empty file: {grype_file}")
                 continue
-            df = parse_grype_json_one(grype_file)
+            df = parse_grype_json_one(grype_file, args.advisories)
             if df.empty:
                 print(f"No vulnerabilities found in Grype output: {grype_file}")
                 continue
