@@ -9,6 +9,7 @@ import json
 import os
 import re
 import urllib.request
+import urllib.parse
 from typing import Iterable, List, Dict
 import numpy as np
 import pandas as pd
@@ -64,6 +65,7 @@ EXCEL_COLUMN_WIDTHS = {
     "Installed Versions": 24,
     "Fixed Versions": 24,
     "Severity": 10.5,
+    "EPSS": 10.5,
     "KEV": 6.5
 }
 
@@ -517,6 +519,66 @@ def parse_grype_json_one(json_path: str, include_advisories: bool):
     df = df.replace([np.inf, -np.inf], pd.NA).fillna("")
     return df
 
+
+# EPSS support (CSV only)
+FIRST_ORG_EPSS_API = "https://api.first.org/data/v1/epss?cve="
+
+# Return a mapping of CVE and EPSS scores from Grype output
+def extract_epss_from_grype_json(json_path: str):
+    out: Dict[str, float] = {}
+    try:
+        with open(json_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return out
+
+    for match in (data or {}).get("matches", []) or []:
+        vuln = (match or {}).get("vulnerability", {}) or {}
+        epss_list = vuln.get("epss", []) or []
+        if not isinstance(epss_list, list):
+            continue
+        for entry in epss_list:
+            if not isinstance(entry, dict):
+                continue
+            cve = convert_id(str(entry.get("cve", "") or ""))
+            if not cve_token(cve):
+                continue
+            try:
+                score_f = float(entry.get("epss"))
+            except Exception:
+                continue
+            prev = out.get(cve)
+            if prev is None or score_f > prev:
+                out[cve] = score_f
+    return out
+
+# Get EPSS scores from first.org if present in Trivy file and not Grype
+def fetch_epss_from_first_org(cve: str, timeout: int = 20) -> float:
+    cve = convert_id(str(cve or ""))
+    if not cve_token(cve):
+        return float("nan")
+    try:
+        url = FIRST_ORG_EPSS_API + urllib.parse.quote(cve, safe="")
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            body = resp.read()
+        payload = json.loads(body)
+        records = (payload or {}).get("data", []) or []
+        if not records:
+            return float("nan")
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            if convert_id(str(rec.get("cve", "") or "")) != cve:
+                continue
+            try:
+                return float(rec.get("epss"))
+            except Exception:
+                return float("nan")
+        return float("nan")
+    except Exception:
+        return float("nan")
+
+
 # KEV support for Trivy input
 def load_kev_ids_from_github(url: str = KEV_CISA_GITHUB, timeout: int = 20):
     kev = set()
@@ -682,6 +744,25 @@ def write_df_to_sheet(writer: pd.ExcelWriter, df: pd.DataFrame, sheet_name: str)
 
     ws.autofilter(0, 0, max(number_rows, 1), max(number_columns - 1, 0))
 
+# For CSV output only, ensure each CVE appears in its own row
+def separate_cves_csv(df: pd.DataFrame):
+    if df.empty or "CVEs" not in df.columns:
+        return df
+
+    rows = []
+    for _, row in df.iterrows():
+        cves = extract_cves(str(row["CVEs"]))
+        if not cves:
+            continue
+
+        for cve in cves:
+            new_row = row.copy()
+            new_row["CVEs"] = cve
+            rows.append(new_row)
+
+    return pd.DataFrame(rows, columns=df.columns)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Combine Trivy JSON and Grype JSON into a single .xlsx file")
     ap.add_argument("--trivy", nargs="*", default=[],
@@ -689,6 +770,7 @@ def main():
     ap.add_argument("--grype", nargs="*", default=[],
                     help="Directory or file for Grype JSON file(s) (e.g., /path/to/*.json)")
     ap.add_argument("--kev", action="store_true", help="Check KEV from CISA GitHub and tag Trivy rows if a CVE is present.")
+    ap.add_argument("--epss", action="store_true", help="Add EPSS score column from Grype, queried from first.org.")
     ap.add_argument("--advisories", action="store_true", help="Include advisory IDs (GHSA/RHSA/USN/...) alongside CVEs in the CVEs column. CVEs are always included.")
 
     out_group = ap.add_mutually_exclusive_group(required=True)
@@ -728,6 +810,9 @@ def main():
         combined_frames = []
         frames_by_id: Dict[str, list] = {}
         name_by_id: Dict[str, str] = {}
+        # EPSS is only supported for CSV output (requires --epss and --csv)
+        epss_cache: Dict[str, float] = {}
+        epss_by_id: Dict[str, Dict[str, float]] = defaultdict(dict)
         # Trivy
         for trivy_file in trivy_json_files:
             try:
@@ -756,6 +841,20 @@ def main():
                     print(f"No vulnerabilities found in Grype output: {grype_file}")
                     continue
                 key, nice_name = sheet_key_and_name_from_grype(grype_file)
+
+                # If EPSS requested (CSV only), capture EPSS scores from Grype JSON now
+                if args.epss:
+                    try:
+                        file_map = extract_epss_from_grype_json(grype_file)
+                        if file_map:
+                            current = epss_by_id.setdefault(key, {})
+                            for cve, score in file_map.items():
+                                prev = current.get(cve)
+                                if prev is None or score > prev:
+                                    current[cve] = score
+                    except Exception as e:
+                        print(f"Failed to parse EPSS from Grype JSON {grype_file}: {e}")
+
                 frames_by_id.setdefault(key, []).append(df)
                 # prefer tag from Grype in case only Grype is supplied
                 tag = extract_grype_sheet_name(grype_file)
@@ -777,6 +876,7 @@ def main():
 
                 image_display = name_by_id.get(key)
                 merged = merged.copy()
+                merged.insert(0, "image_key", key)
                 merged.insert(0, "Image", image_display)
                 combined_frames.append(merged)
             except Exception as e:
@@ -784,6 +884,37 @@ def main():
 
         if combined_frames:
             out_df = pd.concat(combined_frames, ignore_index=True)
+            out_df = separate_cves_csv(out_df)
+            # Add EPSS column (CSV-only) when --epss is passed
+            if args.epss:
+                def _lookup_epss(row):
+                    cve = convert_id(str(row.get("CVEs", "") or ""))
+                    if not cve_token(cve):
+                        return ""
+                    img_key = str(row.get("image_key", "") or "")
+                    # 1) Extract score from Grype
+                    score = epss_by_id.get(img_key, {}).get(cve) if img_key else None
+                    if score is not None:
+                        return score
+                    # Check against all images
+                    if cve in epss_cache:
+                        cached = epss_cache[cve]
+                        return "" if (isinstance(cached, float) and np.isnan(cached)) else cached
+
+                    fetched = fetch_epss_from_first_org(cve)
+                    epss_cache[cve] = fetched
+                    return "" if (isinstance(fetched, float) and np.isnan(fetched)) else fetched
+
+                out_df = out_df.copy()
+                epss_values = out_df.apply(_lookup_epss, axis=1)
+                if "CVEs" in out_df.columns:
+                    pos = list(out_df.columns).index("CVEs") + 1
+                    out_df.insert(pos, "EPSS", epss_values)
+                else:
+                    out_df["EPSS"] = epss_values
+
+            if "image_key" in out_df.columns:
+                out_df = out_df.drop(columns=["image_key"])
             try:
                 out_df.to_csv(args.csv, index=False)
                 print(f"CSV file saved: {args.csv}")
