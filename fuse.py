@@ -9,6 +9,7 @@ import json
 import os
 import re
 import urllib.request
+import urllib.parse
 from typing import Iterable, List, Dict
 import numpy as np
 import pandas as pd
@@ -51,6 +52,7 @@ TRIVY_TYPE_MAP = {
     "go": "golang",
     "python": "python",
     "pip": "python",
+    "python-pkg": "python",
     "gem": "gem",
     "ruby": "ruby",
 }
@@ -62,7 +64,9 @@ EXCEL_COLUMN_WIDTHS = {
     "CVEs": 22,
     "Installed Versions": 24,
     "Fixed Versions": 24,
+    "Minimum Fix-All Version": 24,
     "Severity": 10.5,
+    "EPSS": 10.5,
     "KEV": 6.5
 }
 
@@ -210,6 +214,16 @@ def deduplicate_ids(ids: List[str]):
             seen_cves.add(cve)
     return out
 
+# Filter a list of IDs so CVEs are always included, and advisories are optional
+def filter_ids(ids: List[str], include_advisories: bool):
+    ids = deduplicate_ids(ids)
+    if include_advisories:
+        return order_cves_first(ids)
+    # keep CVEs only
+    cves_only = [x for x in ids if cve_token(x)]
+    return order_cves_first(cves_only)
+
+
 # Dreate mapping for severity ranks
 SEVERITY_RANK = {
     "CRITICAL": 5, "Critical": 5,
@@ -238,6 +252,15 @@ def aggregate_severity(severity_values: List[str]):
 
 # Combine packages for de-duplication purposes
 def combine_by_package(df: pd.DataFrame):
+    """
+    De-duplicate scanner findings without losing the relationship between a
+    CVE and its installed version, fixed version, or severity.
+
+    IMPORTANT: A vulnerability finding is keyed by Package + Type + CVE.
+    The previous implementation grouped only by Package + Type, which merged
+    different CVEs into one row and then assigned the aggregate fixed version
+    and severity to every CVE when CSV output was later expanded.
+    """
     # Ensure expected columns exist
     for col in EXPECTED_COLUMNS:
         if col not in df.columns:
@@ -250,35 +273,66 @@ def combine_by_package(df: pd.DataFrame):
     df = df.copy()
     df["Type"] = df["Type"].map(normalize_type)
 
-    grouped_package_type = df.groupby(["Package", "Type"], dropna=False, sort=False)
+    # Expand each scanner record to one internal row per CVE BEFORE grouping.
+    # Advisory IDs, when requested, remain associated with the CVE(s) from the
+    # same scanner record. Rows with no CVE are retained using an advisory key
+    # so XLSX output does not silently discard them.
+    expanded_rows = []
+    for _, row in df.iterrows():
+        cell = str(row.get("CVEs", "") or "")
+        ids = split_values(cell)
+        cves = extract_cves(cell)
+        advisories = [x for x in ids if not cve_token(x)]
+
+        if cves:
+            for cve in cves:
+                new_row = row.copy()
+                row_ids = order_cves_first(deduplicate_ids([cve] + advisories))
+                new_row["CVEs"] = "\n".join(row_ids)
+                new_row["_CVEKey"] = cve
+                expanded_rows.append(new_row)
+        else:
+            new_row = row.copy()
+            normalized_ids = order_cves_first(deduplicate_ids(ids))
+            new_row["CVEs"] = "\n".join(normalized_ids)
+            # Keep advisory-only/non-CVE findings distinct from CVE findings.
+            new_row["_CVEKey"] = "ADVISORY:" + "|".join(normalized_ids)
+            expanded_rows.append(new_row)
+
+    if not expanded_rows:
+        return pd.DataFrame(columns=EXPECTED_COLUMNS)
+
+    expanded = pd.DataFrame(expanded_rows)
+
+    # CVE is now part of the identity of a finding.
+    grouped_package_type_cve = expanded.groupby(
+        ["Package", "Type", "_CVEKey"], dropna=False, sort=False
+    )
     new_rows = []
 
-    for (package, typ), grouped in grouped_package_type:
-        # Gather CVEs
+    for (package, typ, _cve_key), grouped in grouped_package_type_cve:
+        # Gather the single CVE plus any associated advisory aliases from both scanners.
         ids_all = []
         for cell in grouped["CVEs"].tolist():
             ids_all.extend(split_values(cell))
         ids_all = order_cves_first(deduplicate_ids(ids_all))
 
-        # Gather Installed versions
-        installed_cells = grouped["Installed Versions"].tolist()
+        # Gather installed versions only for this Package + Type + CVE.
         installed_flat = []
-        for cell in installed_cells:
+        for cell in grouped["Installed Versions"].tolist():
             installed_flat.extend(split_values(cell))
         installed_all = dedupe_and_order(installed_flat)
 
-        # Gather Fixed versions
-        fixed_cells = grouped["Fixed Versions"].tolist()
+        # Gather fixed versions only for this Package + Type + CVE.
         fixed_flat = []
-        for cell in fixed_cells:
+        for cell in grouped["Fixed Versions"].tolist():
             fixed_flat.extend(split_values(cell))
         fixed_all = get_latest_version(fixed_flat)
 
-        # Aggregate severity
+        # Aggregate severity only across duplicate scanner records for this CVE.
         severity_cells = grouped["Severity"].tolist()
         agg_sev = aggregate_severity(severity_cells)
 
-        # Create row with gathered values
         new_rows.append([
             package,
             typ,
@@ -325,6 +379,73 @@ def get_latest_version(items: List[str]):
     latest = max(deduped, key=version_key)
     return [latest]
 
+def add_minimum_fix_all_version(df: pd.DataFrame, image_column: str = ""):
+    """
+    Add a package-level Minimum Fix-All Version while preserving each row's
+    CVE-specific Fixed Versions value.
+
+    The fix-all value is calculated per image + Package + Type when an image
+    column is supplied, otherwise per Package + Type (for one-image XLSX sheets).
+    It is the highest CVE-specific fixed version in that package group, using
+    the script's existing version comparison logic. If any CVE in the group has
+    no fixed version, the value is left blank because a version that fixes ALL
+    identified CVEs cannot be established from the scanner data.
+    """
+    df = df.copy()
+    column_name = "Minimum Fix-All Version"
+
+    if df.empty:
+        pos = list(df.columns).index("Fixed Versions") + 1 if "Fixed Versions" in df.columns else len(df.columns)
+        df.insert(pos, column_name, "")
+        return df
+
+    group_cols = ["Package", "Type"]
+    if image_column and image_column in df.columns:
+        group_cols = [image_column] + group_cols
+
+    fix_all_by_group = {}
+    for group_key, grouped in df.groupby(group_cols, dropna=False, sort=False):
+        # Only actual CVE findings drive the package fix-all calculation.
+        cve_rows = grouped[grouped["CVEs"].astype(str).map(lambda x: bool(extract_cves(x)))]
+        if cve_rows.empty:
+            fix_all_by_group[group_key] = ""
+            continue
+
+        fixed_values = []
+        missing_fix = False
+        for cell in cve_rows["Fixed Versions"].tolist():
+            values = split_values(cell)
+            if not values:
+                missing_fix = True
+                break
+            fixed_values.extend(values)
+
+        if missing_fix or not fixed_values:
+            fix_all_by_group[group_key] = ""
+        else:
+            latest = get_latest_version(fixed_values)
+            fix_all_by_group[group_key] = latest[0] if latest else ""
+
+    def _group_key_for_row(row):
+        vals = [row[col] for col in group_cols]
+        return tuple(vals) if len(vals) > 1 else vals[0]
+
+    fix_all_values = []
+    for _, row in df.iterrows():
+        # Advisory-only rows do not receive a fix-all value.
+        if not extract_cves(str(row.get("CVEs", "") or "")):
+            fix_all_values.append("")
+            continue
+        fix_all_values.append(fix_all_by_group.get(_group_key_for_row(row), ""))
+
+    if column_name in df.columns:
+        df[column_name] = fix_all_values
+    else:
+        pos = list(df.columns).index("Fixed Versions") + 1 if "Fixed Versions" in df.columns else len(df.columns)
+        df.insert(pos, column_name, fix_all_values)
+    return df
+
+
 def normalize_type(t: str) -> str:
     t = (t or "").strip().lower()
     return "golang" if t in GO_TYPES else t
@@ -362,7 +483,7 @@ def collect_advisory_ids_from_trivy(vuln: Dict):
 
 ###
 # Read Trivy JSON output
-def read_trivy_json(json_path: str):
+def read_trivy_json(json_path: str, include_advisories: bool):
     try:
         with open(json_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -379,11 +500,14 @@ def read_trivy_json(json_path: str):
         vulns_list = (result or {}).get("Vulnerabilities", []) or []
         for vulnerability in vulns_list:
             package = str(vulnerability.get("PkgName", "") or vulnerability.get("PkgID", "") or "")
+            if reported_type == "python":
+                package = package.lower()
             installed = str(vulnerability.get("InstalledVersion", "") or "")
             fixed = str(vulnerability.get("FixedVersion", "") or "")
             severity = str(vulnerability.get("Severity", "") or "Unknown")
 
             ids = collect_advisory_ids_from_trivy(vulnerability)
+            ids = filter_ids(ids, include_advisories)
             cves_cell = "\n".join(ids)
 
             rows.append([package, reported_type, cves_cell, installed, fixed, severity])
@@ -405,7 +529,7 @@ def iter_paths(spec: Iterable[str]):
                     yield file
 
 # Parse Grype JSON outputs
-def parse_grype_json_one(json_path: str):
+def parse_grype_json_one(json_path: str, include_advisories: bool):
     try:
         with open(json_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -424,7 +548,9 @@ def parse_grype_json_one(json_path: str):
         package = str(art.get("name", "") or "")
         installed = str(art.get("version", "") or "")
         type_raw = str(art.get("type", "") or "")
-        type = normalize_type(type_raw)
+        pkg_type = normalize_type(type_raw)
+        if pkg_type == "python":
+            package = package.lower()
         #type = str(art.get("type", "") or "")
 
         id_list = []
@@ -439,18 +565,28 @@ def parse_grype_json_one(json_path: str):
                 if advisory_id:
                     id_list.append(convert_id(advisory_id))
 
-        related_vulnerabilities = vuln.get("relatedVulnerabilities", []) or []
+        # Grype stores CVEs for Java separately in relatedVulnerabilities
+        related_vulnerabilities = match.get("relatedVulnerabilities", []) or vuln.get("relatedVulnerabilities", []) or []
         if isinstance(related_vulnerabilities, list):
             for related_vuln in related_vulnerabilities:
                 related_vuln_id = str((related_vuln or {}).get("id", "") or "")
                 if related_vuln_id:
                     id_list.append(convert_id(related_vuln_id))
 
+        # Grype outputs also repeat the CVE under vulnerability.epss[].cve
+        epss_list = vuln.get("epss", []) or []
+        if isinstance(epss_list, list):
+            for e in epss_list:
+                epss_cve = str((e or {}).get("cve", "") or "")
+                if epss_cve:
+                    id_list.append(convert_id(epss_cve))
+
         # dedup preserving order
         seen = set(); ids_unique = []
         for item in id_list:
             if item not in seen:
                 seen.add(item); ids_unique.append(item)
+        ids_unique = filter_ids(ids_unique, include_advisories)
         cves_cell = "\n".join(ids_unique)
 
         fix = vuln.get("fix", {}) or {}
@@ -485,11 +621,71 @@ def parse_grype_json_one(json_path: str):
         if kev_bool and "(KEV)" not in severity:
             severity = f"{severity} (KEV)" if severity else "Unknown (KEV)"
 
-        rows.append([package, type, cves_cell, installed, fixed, severity])
+        rows.append([package, pkg_type, cves_cell, installed, fixed, severity])
 
     df = pd.DataFrame(rows, columns=EXPECTED_COLUMNS)
     df = df.replace([np.inf, -np.inf], pd.NA).fillna("")
     return df
+
+
+# EPSS support (CSV only)
+FIRST_ORG_EPSS_API = "https://api.first.org/data/v1/epss?cve="
+
+# Return a mapping of CVE and EPSS scores from Grype output
+def extract_epss_from_grype_json(json_path: str):
+    out: Dict[str, float] = {}
+    try:
+        with open(json_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return out
+
+    for match in (data or {}).get("matches", []) or []:
+        vuln = (match or {}).get("vulnerability", {}) or {}
+        epss_list = vuln.get("epss", []) or []
+        if not isinstance(epss_list, list):
+            continue
+        for entry in epss_list:
+            if not isinstance(entry, dict):
+                continue
+            cve = convert_id(str(entry.get("cve", "") or ""))
+            if not cve_token(cve):
+                continue
+            try:
+                score_f = float(entry.get("epss"))
+            except Exception:
+                continue
+            prev = out.get(cve)
+            if prev is None or score_f > prev:
+                out[cve] = score_f
+    return out
+
+# Get EPSS scores from first.org if present in Trivy file and not Grype
+def fetch_epss_from_first_org(cve: str, timeout: int = 20) -> float:
+    cve = convert_id(str(cve or ""))
+    if not cve_token(cve):
+        return float("nan")
+    try:
+        url = FIRST_ORG_EPSS_API + urllib.parse.quote(cve, safe="")
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            body = resp.read()
+        payload = json.loads(body)
+        records = (payload or {}).get("data", []) or []
+        if not records:
+            return float("nan")
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            if convert_id(str(rec.get("cve", "") or "")) != cve:
+                continue
+            try:
+                return float(rec.get("epss"))
+            except Exception:
+                return float("nan")
+        return float("nan")
+    except Exception:
+        return float("nan")
+
 
 # KEV support for Trivy input
 def load_kev_ids_from_github(url: str = KEV_CISA_GITHUB, timeout: int = 20):
@@ -656,6 +852,75 @@ def write_df_to_sheet(writer: pd.ExcelWriter, df: pd.DataFrame, sheet_name: str)
 
     ws.autofilter(0, 0, max(number_rows, 1), max(number_columns - 1, 0))
 
+# For CSV output only, ensure each CVE appears in its own row
+def separate_cves_csv(df: pd.DataFrame):
+    if df.empty or "CVEs" not in df.columns:
+        return df
+
+    rows = []
+    for _, row in df.iterrows():
+        cves = extract_cves(str(row["CVEs"]))
+        if not cves:
+            continue
+
+        for cve in cves:
+            new_row = row.copy()
+            new_row["CVEs"] = cve
+            rows.append(new_row)
+
+    return pd.DataFrame(rows, columns=df.columns)
+
+
+def safe_type_filename(package_type: str) -> str:
+    """Return a filesystem-safe label for a package type."""
+    value = normalize_type(str(package_type or "")).strip().lower()
+    if not value:
+        value = "unknown"
+    value = re.sub(r"[^a-z0-9._-]+", "-", value)
+    value = re.sub(r"-+", "-", value).strip("-._")
+    return value or "unknown"
+
+
+def write_type_csvs(df: pd.DataFrame, combined_csv_path: str):
+    """Write one CSV per normalized package Type next to the combined CSV."""
+    if df.empty or "Type" not in df.columns:
+        print("No package types found. Skipping separate type CSV creation.")
+        return []
+
+    output_path = os.path.abspath(combined_csv_path)
+    output_dir = os.path.dirname(output_path) or "."
+    base_name = os.path.basename(output_path)
+    stem, ext = os.path.splitext(base_name)
+    if not ext:
+        ext = ".csv"
+
+    written = []
+    normalized_types = df["Type"].fillna("").astype(str).map(normalize_type)
+
+    # Preserve first-seen type ordering instead of sorting alphabetically.
+    seen_types = []
+    seen = set()
+    for package_type in normalized_types.tolist():
+        key = package_type or ""
+        if key not in seen:
+            seen.add(key)
+            seen_types.append(key)
+
+    for package_type in seen_types:
+        mask = normalized_types == package_type
+        type_df = df.loc[mask].copy()
+        if type_df.empty:
+            continue
+
+        label = safe_type_filename(package_type)
+        type_path = os.path.join(output_dir, f"{stem}_{label}{ext}")
+        type_df.to_csv(type_path, index=False)
+        written.append(type_path)
+        print(f"Type CSV saved ({package_type or 'unknown'}): {type_path}")
+
+    return written
+
+
 def main():
     ap = argparse.ArgumentParser(description="Combine Trivy JSON and Grype JSON into a single .xlsx file")
     ap.add_argument("--trivy", nargs="*", default=[],
@@ -663,6 +928,10 @@ def main():
     ap.add_argument("--grype", nargs="*", default=[],
                     help="Directory or file for Grype JSON file(s) (e.g., /path/to/*.json)")
     ap.add_argument("--kev", action="store_true", help="Check KEV from CISA GitHub and tag Trivy rows if a CVE is present.")
+    ap.add_argument("--epss", action="store_true", help="Add EPSS score column from Grype, queried from first.org.")
+    ap.add_argument("--advisories", action="store_true", help="Include advisory IDs (GHSA/RHSA/USN/...) alongside CVEs in the CVEs column. CVEs are always included.")
+    ap.add_argument("--separate-types", action="store_true",
+                    help="With --csv, also write one CSV per package Type (for example: python, golang, rpm, deb, java-archive).")
 
     out_group = ap.add_mutually_exclusive_group(required=True)
     out_group.add_argument("--out", help="Output .xlsx path (multi-sheet, one sheet per image)")
@@ -670,6 +939,9 @@ def main():
 
 
     args = ap.parse_args()
+
+    if args.separate_types and not args.csv:
+        ap.error("--separate-types requires --csv because it creates CSV outputs grouped by package type.")
 
     kev_ids = set()
     if args.kev:
@@ -701,13 +973,16 @@ def main():
         combined_frames = []
         frames_by_id: Dict[str, list] = {}
         name_by_id: Dict[str, str] = {}
+        # EPSS is only supported for CSV output (requires --epss and --csv)
+        epss_cache: Dict[str, float] = {}
+        epss_by_id: Dict[str, Dict[str, float]] = defaultdict(dict)
         # Trivy
         for trivy_file in trivy_json_files:
             try:
                 if os.path.getsize(trivy_file) == 0:
                     print(f"Skipping empty file: {trivy_file}")
                     continue
-                df = read_trivy_json(trivy_file)
+                df = read_trivy_json(trivy_file, args.advisories)
                 if df.empty:
                     print(f"No vulnerabilities found in Trivy output: {trivy_file}")
                     continue
@@ -724,18 +999,32 @@ def main():
                 if os.path.getsize(grype_file) == 0:
                     print(f"Skipping empty file: {grype_file}")
                     continue
-                df = parse_grype_json_one(grype_file)
+                df = parse_grype_json_one(grype_file, args.advisories)
                 if df.empty:
                     print(f"No vulnerabilities found in Grype output: {grype_file}")
                     continue
                 key, nice_name = sheet_key_and_name_from_grype(grype_file)
+
+                # If EPSS requested (CSV only), capture EPSS scores from Grype JSON now
+                if args.epss:
+                    try:
+                        file_map = extract_epss_from_grype_json(grype_file)
+                        if file_map:
+                            current = epss_by_id.setdefault(key, {})
+                            for cve, score in file_map.items():
+                                prev = current.get(cve)
+                                if prev is None or score > prev:
+                                    current[cve] = score
+                    except Exception as e:
+                        print(f"Failed to parse EPSS from Grype JSON {grype_file}: {e}")
+
                 frames_by_id.setdefault(key, []).append(df)
                 # prefer tag from Grype in case only Grype is supplied
                 tag = extract_grype_sheet_name(grype_file)
                 if tag:
                     name_by_id[key] = tag
                 elif key not in name_by_id:
-                    name_by_id[key] = sheet_name
+                    name_by_id[key] = nice_name
             except Exception as e:
                 print(f"Failed to process Grype JSON {grype_file}: {e}")
 
@@ -750,6 +1039,7 @@ def main():
 
                 image_display = name_by_id.get(key)
                 merged = merged.copy()
+                merged.insert(0, "image_key", key)
                 merged.insert(0, "Image", image_display)
                 combined_frames.append(merged)
             except Exception as e:
@@ -757,9 +1047,45 @@ def main():
 
         if combined_frames:
             out_df = pd.concat(combined_frames, ignore_index=True)
+            out_df = separate_cves_csv(out_df)
+            # Preserve the row-specific Fixed Versions value and add the minimum
+            # package version that fixes all identified CVEs for this image.
+            out_df = add_minimum_fix_all_version(out_df, image_column="Image")
+            # Add EPSS column (CSV-only) when --epss is passed
+            if args.epss:
+                def _lookup_epss(row):
+                    cve = convert_id(str(row.get("CVEs", "") or ""))
+                    if not cve_token(cve):
+                        return ""
+                    img_key = str(row.get("image_key", "") or "")
+                    # 1) Extract score from Grype
+                    score = epss_by_id.get(img_key, {}).get(cve) if img_key else None
+                    if score is not None:
+                        return score
+                    # Check against all images
+                    if cve in epss_cache:
+                        cached = epss_cache[cve]
+                        return "" if (isinstance(cached, float) and np.isnan(cached)) else cached
+
+                    fetched = fetch_epss_from_first_org(cve)
+                    epss_cache[cve] = fetched
+                    return "" if (isinstance(fetched, float) and np.isnan(fetched)) else fetched
+
+                out_df = out_df.copy()
+                epss_values = out_df.apply(_lookup_epss, axis=1)
+                if "CVEs" in out_df.columns:
+                    pos = list(out_df.columns).index("CVEs") + 1
+                    out_df.insert(pos, "EPSS", epss_values)
+                else:
+                    out_df["EPSS"] = epss_values
+
+            if "image_key" in out_df.columns:
+                out_df = out_df.drop(columns=["image_key"])
             try:
                 out_df.to_csv(args.csv, index=False)
                 print(f"CSV file saved: {args.csv}")
+                if args.separate_types:
+                    write_type_csvs(out_df, args.csv)
             except Exception as e:
                 print(f"Failed to save CSV to {args.csv}: {e}")
         else:
@@ -781,7 +1107,7 @@ def main():
             if os.path.getsize(trivy_file) == 0:
                 print(f"Skipping empty file: {trivy_file}")
                 continue
-            df = read_trivy_json(trivy_file)
+            df = read_trivy_json(trivy_file, args.advisories)
             if df.empty:
                 print(f"No vulnerabilities found in Trivy output: {trivy_file}")
                 continue
@@ -798,7 +1124,7 @@ def main():
             if os.path.getsize(grype_file) == 0:
                 print(f"Skipping empty file: {grype_file}")
                 continue
-            df = parse_grype_json_one(grype_file)
+            df = parse_grype_json_one(grype_file, args.advisories)
             if df.empty:
                 print(f"No vulnerabilities found in Grype output: {grype_file}")
                 continue
@@ -814,6 +1140,7 @@ def main():
         try:
             merged = pd.concat(parts, ignore_index=True)
             merged = combine_by_package(merged)
+            merged = add_minimum_fix_all_version(merged)
             merged = mark_df_kev_cve(merged, kev_ids)
             if args.kev:
                 merged = add_kev_flag_column(merged, kev_ids)
